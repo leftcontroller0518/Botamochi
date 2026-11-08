@@ -1,0 +1,20 @@
+# .NET and native build output
+**/bin/
+**/obj/
+out/
+build/
+.vs/
+.idea/
+*.user
+*.suo
+
+# Generated media and diagnostics
+*.mp4
+*.h264
+*.pgc
+*.pgd
+*.log
+
+# Local tooling
+.nuget/
+.dotnet/

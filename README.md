@@ -11,10 +11,8 @@ Botamochiエンジンは、DirectX 12のハードウェアアクセラレーシ�
 ## 詳細技術仕様
 
 ### 1. Zero-Allocation メモリ設計 (GC非発生アーキテクチャ)
-- **64バイトアラインメント・ネイティブメモリ**:
-  `NativeMemory.AlignedAlloc` を採用し、AVX-512キャッシュラインおよびDirect3Dテクスチャ境界に最適化された64バイトアラインメントでメモリを直接確保します。
-- **オブジェクトプーリング機構 (`MemoryPoolManager`)**:
-  フレームデータごとにGCヒープを一切汚染しないよう、`NativeFrameBuffer` を `ConcurrentBag` で再利用するスレッドセーフなネイティブバッファプールを実装。パイプライン稼働中のGen0/Gen1/Gen2ガベージコレクションの発生頻度を「0」に抑え込みます。
+- **128バイトアラインメント・ネイティブリング**:
+  `NativeMemory.AlignedAlloc` で全フレームを起動時に一括確保します。単一生産者の循環インデックスで再利用し、フレームごとの確保、解放、除算、原子的インクリメントを行いません。
 - **モダンC#メモリ抽象化**:
   `Span<T>`, `ReadOnlySpan<T>`, `Memory<T>`, `ref struct`, `unsafe` ポインタ演算を徹底活用し、マネージド／アンマネージド境界のコピーオーバーヘッドを完全に排除しています。
 
@@ -30,17 +28,14 @@ Botamochiエンジンは、DirectX 12のハードウェアアクセラレーシ�
 - **固定小数点 BT.709 マトリクス変換**:
   浮動小数点演算を16bitシフトの固定小数点整数演算へと最適化し、キャッシュヒット率を最大化しながらRGBAからNV12（Y平面＋2x2クロマサブサンプリングUVインターリーブ平面）への超高速変換を行います。
 
-### 4. BoundedChannel によるバックプレッシャー同期
-- **非同期プロデューサー・コンシューマー パイプライン**:
-  GPUレンダリング側（プロデューサー）とFFmpegエンコード書き出し側（コンシューマー）の間を `System.Threading.Channels` (`Channel.CreateBounded<T>`) で接続。
-- **自動背圧制御 (`BoundedChannelFullMode.Wait`)**:
-  エンコード処理の遅延やI/Oボトルネックが発生した際、GPU側の生成速度を自然に抑制（ウェイト）させ、メモリの急膨張やバッファ枯渇を未然に防ぎます。
+### 4. 固定長SPSCリングによるバックプレッシャー同期
+- **単一生産者・単一消費者パイプライン**:
+  GPUレンダリング側とFFmpeg書き込み側を事前確保した配列で接続します。読み書き位置はそれぞれのスレッドだけが更新し、空きがある高速経路ではカーネル待機を行いません。
+- **割り当てのない背圧制御**:
+  キューが満杯または空のときだけ再利用可能なイベントで待機します。Task、Channelノード、フレームメタデータを毎フレーム生成しません。
 
-### 5. 高精度 PTS / DTS タイムスタンプ同期 (YMM4互換)
-- **リップシンク（音ズレ）防止**:
-  `Stopwatch.Frequency` クロックを基準とした高分解能タイマーによる厳密な Presentation Time Stamp (PTS) を算出。
-- **マルチプレクサ整合性**:
-  動画編集ソフト（YukkuriMovieMaker4等）で問題となりやすい可変フレームレート（VFR）由来のコマ落ちや音声トラックとのズレを完全に排除します。
+### 5. 固定フレームレート出力
+- FFmpeg入力に指定したフレームレートと投入順からタイムスタンプを生成します。Direct複数セッションでもフレーム区間を順番に結合してからMP4へ格納します。
 
 ### 6. FFmpeg プロセス統合 & ストリーミング
 - **標準入力ストリーミング (`FfmpegProcessBridge`)**:
@@ -61,10 +56,10 @@ Botamochiエンジンは、DirectX 12のハードウェアアクセラレーシ�
 [ GPU Compute Kernel (ComputeSharp HLSL) ] ── (色調補正・エフェクト・超並列コンピュート)
                     │ (Direct Memory Access / Zero-Copy)
                     ▼
-[ Native Frame Pool (MemoryPoolManager) ] ◄── (Zero-Allocation 64-byte AlignedAlloc)
+[ Native Frame Ring ] ◄── (Zero-Allocation 128-byte AlignedAlloc)
                     │ (Pooled Frame Payload)
                     ▼
-[ Bounded Channel (EncoderPipeline) ] ── (Backpressure, Frame-Drop, PTS/DTS Calculator)
+[ SPSC Ring (EncoderPipeline) ] ── (Allocation-free Backpressure)
                     │ (Asynchronous Non-blocking Stream)
                     ▼
 [ FfmpegProcessBridge (StandardInput Pipe) ] ── (NVENC / QSV / AMF / libx264 MP4 Export)
@@ -81,15 +76,16 @@ botamochi/
 └── src/
     ├── Botamochi.csproj            # .NET 10 最適化プロジェクト定義
     ├── Program.cs                  # パイプライン・エントリーポイント
+    ├── RenderOptions.cs            # CLI解析と入力検証
     ├── Core/
-    │   └── MemoryPoolManager.cs    # ネイティブメモリプール (Zero-Allocation)
+    │   └── NativeRingBufferPool.cs # 事前確保ネイティブリング
     ├── Gpu/
     │   ├── GpuComputeKernel.cs     # ComputeSharp (DirectX 12 Compute Shader)
     │   └── RenderPipeline.cs       # Silk.NET Direct3D 12 オフスクリーン描画
     ├── Simd/
     │   └── SimdConverter.cs        # AVX2/AVX-512 SIMD色空間変換エンジン
     └── Encoder/
-        ├── EncoderPipeline.cs      # Channelバックプレッシャー & PTS同期
+        ├── EncoderPipeline.cs      # SPSCリングとバックプレッシャー
         ├── FfmpegProcessBridge.cs  # FFmpeg StandardInput ストリーマー
         └── HardwareEncoderDetector.cs # GPUハードウェアエンコーダ自動判別
 ```
@@ -119,20 +115,30 @@ Full HD (1920x1080 @ 60fps) の統合レンダリング・エンコードパイ�
 dotnet run -c Release --no-build
 ```
 
+全オプションは `dotnet run -c Release --no-build -- --help` で確認できます。未知のオプションや範囲外の値は描画開始前に終了コード2で報告します。
+
 実行が完了すると、`render_output.mp4` が出力されます。
 
 ---
 
+Native AOT版のビルド、D3D11共有テクスチャ経由のNVENC出力、複数セッション、PGOの再現手順は [Windows高速レンダリング経路](native/README.md) に記載しています。
+
 ## ベンチマーク & パフォーマンス
 
-Full HD (1920x1080) 解像度、60fps レンダリングループにおけるベンチマーク実測値：
+GeForce RTX 3080 Ti Laptop GPU、NVENC、Releaseビルドで、1920×1080・60fps・3秒（180フレーム）のMP4を書き出しました。表は変更前後を交互に各3回実行した中央値です。完了時間はプロセス起動からFFmpegの終了までを含みます。
 
-| 項目 | 測定値 | 備考 |
-| :--- | :--- | :--- |
-| **GC コレクション回数 (Gen0/1/2)** | **0 回** | パイプライン実行中にGCトリガー皆無 |
-| **メモリ割り当て (Managed Heap)** | **0 Byte** | ネイティブプール (`NativeMemory`) 循環 |
-| **GPU コンピュート処理速度** | **< 1.0 ms / フレーム** | ComputeSharp による HLSL 超並列演算 |
-| **スループット** | **リアルタイム 60fps+** | バックプレッシャー同期による安定転送 |
+| パターン | 変更前の完了時間 | 変更後の完了時間 | レンダリングループの平均FPS（変更前 → 変更後） |
+| --- | ---: | ---: | ---: |
+| `bars` | 2.49秒 | 0.94秒 | 109.0 → 337.9 |
+| `plasma`（既定） | 1.55秒 | 1.52秒 | 262.9 → 275.4 |
+
+`src` での実行例：
+
+```powershell
+dotnet run -c Release --no-build -- --pattern bars --duration 3 --output bars.mp4
+```
+
+カラーバーは同じ内容の行をNV12で複製します。プラズマのGPU経路は輝度と色差の計算でRGB値を共有し、ネイティブフレームバッファに読み戻します。幅と高さには偶数を指定してください。幅が4の倍数でない場合はCPUで処理します。
 
 ---
 

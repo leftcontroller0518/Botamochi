@@ -9,8 +9,24 @@
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <Optimize>true</Optimize>
+    <!-- .NET 10 Tiered PGO & Native AOT コンパイル最適化 -->
+    <TieredPGO>true</TieredPGO>
+    <OptimizationPreference>Speed</OptimizationPreference>
+    <DefineConstants Condition="'$(Configuration)' == 'Debug' Or '$(RenderStats)' == 'true'">$(DefineConstants);RENDER_STATS</DefineConstants>
+    <PublishTrimmed Condition="'$(PublishAot)' != 'true'">false</PublishTrimmed>
+    <IlcPgoOptimize>true</IlcPgoOptimize>
     <NoWarn>CA1416;CS0618</NoWarn>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(PgoProfile)' != ''">
+    <MibcFile Include="$(PgoProfile)" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(WaveShader)' != ''">
+    <EmbeddedResource Include="$(WaveShader)" LogicalName="Botamochi.PackWave.dxil" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(NvencLibrary)' != ''">
+    <None Include="$(NvencLibrary)" Link="BotamochiNvenc.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- GPU Compute Shader (DX12/HLSL C#インラインコンパイル) -->

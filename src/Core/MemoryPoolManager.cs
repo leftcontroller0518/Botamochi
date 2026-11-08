@@ -11,7 +11,7 @@ public sealed unsafe class NativeFrameBuffer : IDisposable
 {
     private void* _ptr;
     private readonly int _byteLength;
-    private readonly MemoryPoolManager _owner;
+    private readonly MemoryPoolManager? _owner;
     private int _isDisposed;
 
     public void* NativePointer => _ptr;
@@ -26,13 +26,21 @@ public sealed unsafe class NativeFrameBuffer : IDisposable
         _ptr = NativeMemory.AlignedAlloc((nuint)byteLength, 64);
     }
 
+    internal NativeFrameBuffer(void* pointer, int byteLength)
+    {
+        _ptr = pointer;
+        _byteLength = byteLength;
+    }
+
     public void Return()
     {
-        if (Interlocked.Exchange(ref _isDisposed, 0) == 0)
+        if (_owner != null && Interlocked.Exchange(ref _isDisposed, 1) == 0)
         {
             _owner.ReturnBuffer(this);
         }
     }
+
+    internal void MarkRented() => Volatile.Write(ref _isDisposed, 0);
 
     internal void Terminate()
     {
@@ -80,6 +88,7 @@ public sealed class MemoryPoolManager : IDisposable
 
         if (_pool.TryTake(out var buffer))
         {
+            buffer.MarkRented();
             return buffer;
         }
 

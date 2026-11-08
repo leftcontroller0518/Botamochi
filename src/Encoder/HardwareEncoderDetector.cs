@@ -15,9 +15,9 @@ public enum HardwareAccelerationType
 /// <summary>
 /// 実行環境のGPUハードウェアを検出し、最適なハードウェアエンコーダ（NVENC / QSV / AMF）引数を自動構築するディスパッチャ
 /// </summary>
-public static class HardwareEncoderDetector
+public static partial class HardwareEncoderDetector
 {
-    public static (HardwareAccelerationType Type, string Codec, string ExtraArgs) DetectBestEncoder(ILogger? logger = null)
+    public static (HardwareAccelerationType Type, string Codec, string ExtraArgs) DetectBestEncoder(ILogger? logger = null, int gpu = 0)
     {
         // 1. NVIDIA GPU (NVENC) の検出
         if (IsNvidiaGpuAvailable())
@@ -26,7 +26,7 @@ public static class HardwareEncoderDetector
             return (
                 HardwareAccelerationType.NvidiaNvenc,
                 "h264_nvenc",
-                "-preset p1 -tune ll -rc cbr -gpu 0 -surfaces 16 -b:v 12M -maxrate 15M"
+                $"-preset p1 -tune ll -rc cbr -gpu {gpu} -surfaces 16 -b:v 12M -maxrate 15M"
             );
         }
 
@@ -65,6 +65,21 @@ public static class HardwareEncoderDetector
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
 
+        // Query the driver in-process. Older installations can still use nvidia-smi.
+        try
+        {
+            if (File.Exists(Path.Combine(Environment.SystemDirectory, "nvidia-smi.exe")) && nvmlInit_v2() == 0)
+            {
+                try
+                {
+                    if (nvmlDeviceGetCount_v2(out uint count) == 0) return count > 0;
+                }
+                finally { nvmlShutdown(); }
+            }
+        }
+        catch (DllNotFoundException) { }
+        catch (EntryPointNotFoundException) { }
+
         try
         {
             using var proc = Process.Start(new ProcessStartInfo
@@ -86,6 +101,15 @@ public static class HardwareEncoderDetector
             return false;
         }
     }
+
+    [LibraryImport("nvml.dll"), DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static partial int nvmlInit_v2();
+
+    [LibraryImport("nvml.dll"), DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static partial int nvmlDeviceGetCount_v2(out uint deviceCount);
+
+    [LibraryImport("nvml.dll"), DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+    private static partial int nvmlShutdown();
 
     private static bool IsIntelGpuAvailable()
     {

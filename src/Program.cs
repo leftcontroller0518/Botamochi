@@ -1,23 +1,39 @@
 using System.Diagnostics;
-using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 using Botamochi.Core;
 using Botamochi.Encoder;
 using Botamochi.Gpu;
+using Botamochi.Pipeline;
+using Botamochi.Rendering;
 using Botamochi.Simd;
 
 namespace Botamochi;
 
 public static class Program
 {
-    private const int Width = 1920;
-    private const int Height = 1080;
-    private const int Fps = 60;
-    private const int TotalFrames = 300; // 5秒分 (300フレーム)
-    private const string OutputFile = "render_output.mp4";
-
     public static async Task Main(string[] args)
     {
+        RenderOptions options;
+        try { options = RenderOptions.Parse(args); }
+        catch (ArgumentException ex)
+        {
+            Console.Error.WriteLine($"Botamochi: {ex.Message}");
+            Environment.ExitCode = 2;
+            return;
+        }
+        if (options.ShowHelp)
+        {
+            Console.WriteLine(RenderOptions.Help);
+            return;
+        }
+        int width = options.Width, height = options.Height, fps = options.Fps;
+        int totalFrames = options.FrameCount;
+        float durationSec = options.Duration;
+        string outputFile = options.Output;
+        TestPattern pattern = options.Pattern;
+        bool enablePacing = options.Pace;
+        int[] gpus = options.Gpus;
+
         using var loggerFactory = LoggerFactory.Create(builder =>
         {
             builder.AddConsole().SetMinimumLevel(LogLevel.Information);
@@ -25,112 +41,173 @@ public static class Program
         var logger = loggerFactory.CreateLogger("Botamochi");
 
         logger.LogInformation("=============================================================");
-        logger.LogInformation(" Botamochi .NET 10 Zero-Allocation GPU Render & Encode Pipeline");
-        logger.LogInformation(" Resolution: {Width}x{Height} @ {Fps}fps, Target: {Total} frames", Width, Height, Fps, TotalFrames);
+        logger.LogInformation(" Botamochi .NET 10 Zero-Allocation Ultra-Performance Engine");
+        logger.LogInformation(" Pattern   : {Pattern} | Pacing: {Pacing}", pattern, enablePacing ? "Precise Realtime" : "Uncapped Max Throughput");
+        logger.LogInformation(" Resolution: {Width}x{Height} @ {Fps}fps ({Duration:F1}s, {Total} frames)",
+            width, height, fps, durationSec, totalFrames);
+        logger.LogInformation(" Output    : {OutputFile}", outputFile);
         logger.LogInformation("=============================================================");
 
-        // 1. ネイティブフレームバッファプールの初期化 (NV12用, Zero-Allocation)
-        using var memoryPool = new MemoryPoolManager(Width, Height, maxCapacity: 16);
+        if (options.RealtimePriority)
+        {
+            using var process = Process.GetCurrentProcess();
+            process.PriorityClass = ProcessPriorityClass.RealTime;
+        }
 
-        // 2. FFmpeg プロセスおよびエンコードパイプラインの初期化
-        string ffmpegPath = "ffmpeg"; // PATH環境変数上のffmpeg
+        using var gcScope = new NoGcScope(options.GcBudgetMb);
+        if (options.Direct || options.Lossless || options.Sessions > 1 || gpus.Length > 1)
+        {
+            await DirectRender.Run(width, height, fps, totalFrames, pattern, gpus, Math.Max(gpus.Length, options.Sessions),
+                outputFile, enablePacing, options.NamedPipe, options.PipeBytes, options.NumaNode,
+                options.PhysicalCores, options.Lossless, logger);
+            logger.LogInformation("Direct NVENC completed -> {Path}", Path.GetFullPath(outputFile));
+            return;
+        }
 
+        int frameBytes = checked(width * height * 3 / 2);
+        int queueCapacity = Math.Clamp((96 << 20) / frameBytes - 2, 1, 8);
+        // GPUコンピュートパイプラインの初期化 (DirectX 12 GPU NV12 Pack Kernel)
+        GpuComputePipeline? gpuCompute = null;
+        var colorBars = pattern == TestPattern.ColorBars ? new ColorBarsNv12Renderer(width, height) : null;
+        if (colorBars == null && width % 4 == 0)
+        {
+            try
+            {
+                gpuCompute = new GpuComputePipeline(width, height, queueCapacity + 2, pattern != TestPattern.Plasma,
+                    batchPlasma: !enablePacing && pattern == TestPattern.Plasma);
+                logger.LogInformation("ComputeSharp (DirectX 12 GPU NV12 Pack Kernel) Ready.");
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning("GPUコンピュートをスキップし、CPU AVX-512/AVX2 SIMD を使用します: {Message}", ex.Message);
+            }
+        }
+
+        using var gpu = gpuCompute;
+        // The encoder must drain its queue before either ring is disposed.
+        using var memoryPool = gpuCompute == null ? new NativeRingBufferPool(width, height, queueCapacity + 2) : null;
+
+        // FFmpeg プロセスおよびエンコードパイプラインの初期化 (NVENC)
+        string ffmpegPath = "ffmpeg";
         FfmpegProcessBridge? ffmpegBridge = null;
         EncoderPipeline? pipeline = null;
 
         try
         {
-            ffmpegBridge = new FfmpegProcessBridge(ffmpegPath, Width, Height, Fps, OutputFile, logger);
-            pipeline = new EncoderPipeline(ffmpegBridge, boundedCapacity: 8, logger);
-            logger.LogInformation("FFmpeg Bridge successfully initialized. Output -> {OutputFile}", OutputFile);
+            ffmpegBridge = new FfmpegProcessBridge(ffmpegPath, width, height, fps, outputFile, logger,
+                options.NamedPipe, options.PipeBytes, gpu: gpus[0]);
+            pipeline = new EncoderPipeline(ffmpegBridge, queueCapacity, options.NumaNode, options.PhysicalCores);
+            logger.LogInformation("FFmpeg Video Pipe initialized successfully.");
         }
-        catch (Exception ex)
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 2)
         {
-            logger.LogWarning("FFmpegが見つからないか起動できませんでした: {Message}。オフラインベンチマークモードに切り替えます。", ex.Message);
+            logger.LogWarning("FFmpegを起動できませんでした: {Message}。オフラインベンチマークモードで実行します。", ex.Message);
         }
 
-        // 3. GPUコンピュートパイプラインの初期化
-        GpuComputePipeline? gpuCompute = null;
-        try
-        {
-            gpuCompute = new GpuComputePipeline(Width, Height);
-            logger.LogInformation("ComputeSharp (DirectX 12 Compute Shader) Pipeline Ready.");
-        }
-        catch (Exception ex)
-        {
-            logger.LogWarning("GPUコンピュートの初期化をスキップします: {Message}", ex.Message);
-        }
+        await using var encoding = pipeline;
 
-        // テスト用RGBAフレームソースの確保
-        byte[] rawRgbaSource = new byte[Width * Height * 4];
-        byte[] processedRgba = new byte[Width * Height * 4];
-        Array.Fill<byte>(rawRgbaSource, 128); // ニュートラルグレー
+        var pacer = new PipelinePacer(fps, enablePacing);
+        // RGBA中間バッファ
+        bool needsScene = colorBars == null && (gpuCompute == null || pattern != TestPattern.Plasma);
+        byte[] rawRgbaSource = needsScene && gpuCompute == null ? new byte[width * height * 4] : [];
 
+        using var workers = needsScene ? new SceneWorkers(width, height, pattern) : null;
         var stopwatch = Stopwatch.StartNew();
-        long ticksPerFrame = Stopwatch.Frequency / Fps;
+
+#if RENDER_STATS
+        var swStep = new Stopwatch();
+        double msGen = 0, msTransform = 0;
+#endif
 
         logger.LogInformation("--- Rendering & Encoding Loop Started ---");
 
-        for (int frameIdx = 0; frameIdx < TotalFrames; frameIdx++)
+        for (int frameIdx = 0; frameIdx < totalFrames; frameIdx++)
         {
-            long currentPts = frameIdx * ticksPerFrame;
+            // 精密フレームペーシング制御（スロットリング）
+            await pacer.WaitNextFrameAsync();
 
-            // ネイティブメモリプールからNV12バッファを借用 (GC Allocation: 0)
-            NativeFrameBuffer rentedBuffer = memoryPool.Rent();
+            float timeSeconds = (float)frameIdx / fps;
+            // CPUアリーナまたはGPU読み戻しリングの完成フレーム
+            NativeFrameBuffer rentedBuffer;
 
-            if (gpuCompute != null)
+            // ② GPU完結またはCPU+GPU/SIMDハイブリッドによる超高速レンダリング
+#if RENDER_STATS
+            swStep.Restart();
+#endif
+            if (colorBars != null)
             {
-                // GPU コンピュートカーネルでリアルタイムカラーグレーディング処理を超並列実行
-                gpuCompute.ExecuteColorGrading(rawRgbaSource, processedRgba, brightness: 0.05f, contrast: 1.1f);
+                rentedBuffer = memoryPool!.NextFrame();
+                colorBars.Render(timeSeconds, rentedBuffer.Span);
+#if RENDER_STATS
+                msGen = swStep.Elapsed.TotalMilliseconds;
+                msTransform = 0;
+#endif
+            }
+            else if (gpuCompute != null && pattern == TestPattern.Plasma)
+            {
+                // 【GPU完全直結】GPU数千コアで直接数式描画＆NV12パックを完結
+                rentedBuffer = gpuCompute.RenderPlasmaFrame(frameIdx, fps, totalFrames - frameIdx);
+#if RENDER_STATS
+                msGen = 0.0;
+                msTransform = swStep.Elapsed.TotalMilliseconds;
+#endif
             }
             else
             {
-                rawRgbaSource.CopyTo(processedRgba, 0);
+                // CPU側でのマルチスレッド並列プロシージャル描画
+                workers!.Render(gpuCompute == null ? rawRgbaSource.AsSpan() : gpuCompute.Upload, frameIdx, timeSeconds);
+#if RENDER_STATS
+                msGen = swStep.Elapsed.TotalMilliseconds;
+                swStep.Restart();
+#endif
+                if (gpuCompute != null)
+                {
+                    // GPUによるRGBA -> NV12超高速変換
+                    rentedBuffer = gpuCompute.ConvertUploadedFrame();
+                }
+                else
+                {
+                    rentedBuffer = memoryPool!.NextFrame();
+                    // CPU AVX-512 / AVX2 最新SIMDフォールバック
+                    unsafe
+                    {
+                        fixed (byte* pSrc = rawRgbaSource)
+                        {
+                            byte* pDst = (byte*)rentedBuffer.NativePointer;
+                            Avx512Converter.ConvertRgbaToNv12Vectorized(pSrc, pDst, pDst + width * height, width, height);
+                        }
+                    }
+                }
+#if RENDER_STATS
+                msTransform = swStep.Elapsed.TotalMilliseconds;
+#endif
             }
 
-            // SIMD (AVX2/AVX-512) によるRGBAからNV12への超並列変換
-            unsafe
-            {
-                byte* pSrc = (byte*)Unsafe.AsPointer(ref processedRgba[0]);
-                byte* pDst = (byte*)rentedBuffer.NativePointer;
-                byte* pDstY = pDst;
-                byte* pDstUv = pDst + (Width * Height);
-
-                SimdConverter.ConvertRgbaToNv12(pSrc, pDstY, pDstUv, Width, Height);
-            }
-
-            // エンコードパイプラインへキューイング（バックプレッシャー制御）
+            // ③ 非同期エンコードキューへ送信（バックプレッシャー同期 & Zero-Allocation）
             if (pipeline != null)
             {
-                await pipeline.EnqueueFrameAsync(rentedBuffer, frameIdx, currentPts);
-            }
-            else
-            {
-                // FFmpeg無しの場合は即時プールへ返却
-                rentedBuffer.Return();
+                pipeline.EnqueueFrame(rentedBuffer);
             }
 
-            if ((frameIdx + 1) % 60 == 0 || frameIdx == TotalFrames - 1)
+#if RENDER_STATS
+            // 進捗ログの出力
+            if ((frameIdx + 1) % 60 == 0 || frameIdx == totalFrames - 1)
             {
                 double elapsedSec = stopwatch.Elapsed.TotalSeconds;
                 double currentFps = (frameIdx + 1) / (elapsedSec > 0 ? elapsedSec : 1.0);
                 int queueCount = pipeline?.QueueCount ?? 0;
-                logger.LogInformation("Processed: {Frame}/{Total} frames ({Fps:F1} FPS) | Queue Depth: {Queue}",
-                    frameIdx + 1, TotalFrames, currentFps, queueCount);
+                logger.LogInformation("Frame: {Frame,4}/{Total} ({Progress,5:F1}%) | {Fps,5:F1} FPS | Queue: {Queue} | Gen: {Gen:F1}ms | Trans: {Trans:F1}ms",
+                    frameIdx + 1, totalFrames, ((float)(frameIdx + 1) / totalFrames) * 100.0f, currentFps, queueCount,
+                    msGen, msTransform);
             }
+#endif
         }
 
         stopwatch.Stop();
-        logger.LogInformation("--- Pipeline Finished in {Elapsed:F2}s ({AverageFps:F1} avg FPS) ---",
-            stopwatch.Elapsed.TotalSeconds, TotalFrames / stopwatch.Elapsed.TotalSeconds);
+        double totalSeconds = stopwatch.Elapsed.TotalSeconds;
+        logger.LogInformation("--- Finished: {Total} frames in {Elapsed:F2}s ({AverageFps:F1} avg FPS) ---",
+            totalFrames, totalSeconds, totalFrames / (totalSeconds > 0 ? totalSeconds : 1.0));
 
-        // リソースの安全な破棄
-        if (pipeline != null)
-        {
-            await pipeline.DisposeAsync();
-        }
-        gpuCompute?.Dispose();
-
-        logger.LogInformation("All pipeline resources safely disposed. Completed successfully.");
+        if (pipeline != null) logger.LogInformation("Finalizing {OutputFile}", Path.GetFullPath(outputFile));
     }
 }

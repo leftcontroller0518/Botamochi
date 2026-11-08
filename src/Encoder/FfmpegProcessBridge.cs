@@ -1,115 +1,83 @@
 using System.Diagnostics;
-using System.IO;
-using System.Runtime.CompilerServices;
-using System.Text.RegularExpressions;
+using System.IO.Pipes;
 using Microsoft.Extensions.Logging;
 
 namespace Botamochi.Encoder;
 
-/// <summary>
-/// YMM4互換: 外部FFmpegプロセスを起動し、StandardInput経由で生NV12フレームをパイプストリーミング送信するブリッジ
-/// </summary>
-public sealed partial class FfmpegProcessBridge : IAsyncDisposable
+public sealed class FfmpegProcessBridge : IAsyncDisposable
 {
     private readonly Process _process;
-    private readonly Stream _standardInput;
-    private readonly ILogger _logger;
-    private readonly Task _stderrReadingTask;
-    private readonly CancellationTokenSource _cts = new();
+    private readonly Stream _input;
+    private readonly Task<string> _errors;
 
-    public FfmpegProcessBridge(
-        string ffmpegPath,
-        int width,
-        int height,
-        int fps,
-        string outputPath,
-        ILogger logger)
+    public FfmpegProcessBridge(string ffmpegPath, int width, int height, int fps, string outputPath,
+        ILogger logger, bool namedPipe = false, int pipeBytes = 0, bool encoded = false, int gpu = 0)
     {
-        _logger = logger;
-
-        // rawvideo (NV12) からのハードウェア高速化エンコード引数 (YMM4基準)
-        string arguments = $"-y -f rawvideo -pix_fmt nv12 -s {width}x{height} -r {fps} " +
-                           $"-i - -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p " +
-                           $"\"{outputPath}\"";
-
-        var startInfo = new ProcessStartInfo
+        var info = new ProcessStartInfo(ffmpegPath)
         {
-            FileName = ffmpegPath,
-            Arguments = arguments,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardInput = true,
-            RedirectStandardError = true,
-            RedirectStandardOutput = false
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardError = true,
+            RedirectStandardInput = !namedPipe
         };
-
-        _process = new Process { StartInfo = startInfo };
-        
+        void Add(params string[] args)
+        {
+            foreach (string arg in args) info.ArgumentList.Add(arg);
+        }
+        string name = $"botamochi-{Guid.NewGuid():N}";
+        Add("-nostdin", "-loglevel", "error", "-y", "-f", encoded ? "h264" : "rawvideo");
+        if (!encoded) Add("-pix_fmt", "nv12", "-s", $"{width}x{height}");
+        Add("-r", fps.ToString(), "-i", namedPipe ? $@"\\.\pipe\{name}" : "pipe:0");
+        if (encoded) Add("-c:v", "copy");
+        else
+        {
+            var (type, codec, extra) = HardwareEncoderDetector.DetectBestEncoder(logger, gpu);
+            Add("-c:v", codec);
+            Add(extra.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            Add("-pix_fmt", type == HardwareAccelerationType.NvidiaNvenc ? "nv12" : "yuv420p");
+        }
+        Add(outputPath);
+        int bufferSize = pipeBytes > 0 ? pipeBytes : Math.Clamp(width * height * 3 / 2, 65536, 4 << 20);
+        var pipe = namedPipe ? new NamedPipeServerStream(name, PipeDirection.Out, 1,
+            PipeTransmissionMode.Byte, PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly, 0, bufferSize) : null;
+        _process = new Process { StartInfo = info };
+        bool started = false;
         try
         {
             _process.Start();
+            started = true;
+            _errors = _process.StandardError.ReadToEndAsync();
+            if (pipe != null)
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+                var connect = pipe.WaitForConnectionAsync(timeout.Token);
+                var exit = _process.WaitForExitAsync(timeout.Token);
+                if (Task.WhenAny(connect, exit).GetAwaiter().GetResult() == exit && _process.HasExited)
+                    throw new IOException(_errors.GetAwaiter().GetResult());
+                connect.GetAwaiter().GetResult();
+                _input = pipe;
+            }
+            else _input = pipeBytes > 0 ? new BufferedStream(_process.StandardInput.BaseStream, pipeBytes)
+                                        : _process.StandardInput.BaseStream;
         }
-        catch (Exception ex)
+        catch
         {
-            _logger.LogError(ex, "FFmpegプロセスの起動に失敗しました。パスを確認してください: {Path}", ffmpegPath);
+            pipe?.Dispose();
+            if (started && !_process.HasExited) _process.Kill();
+            _process.Dispose();
             throw;
         }
-
-        // 4MBのバッファリングストリームでパイプ転送詰まりを防止
-        _standardInput = new BufferedStream(_process.StandardInput.BaseStream, 4 * 1024 * 1024);
-
-        // 標準エラー出力を監視して進捗・FPSをリアルタイムパース
-        _stderrReadingTask = Task.Run(() => ReadStderrAsync(_process.StandardError, _cts.Token));
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public async ValueTask WriteFrameAsync(ReadOnlyMemory<byte> frameData, CancellationToken ct)
-    {
-        await _standardInput.WriteAsync(frameData, ct).ConfigureAwait(false);
-    }
-
-    private async Task ReadStderrAsync(StreamReader reader, CancellationToken ct)
-    {
-        Regex fpsRegex = FpsRegex();
-        while (!ct.IsCancellationRequested && !_process.HasExited)
-        {
-            string? line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
-            if (line == null) break;
-
-            var match = fpsRegex.Match(line);
-            if (match.Success)
-            {
-                _logger.LogDebug("[FFmpeg Progress] {Line}", line);
-            }
-        }
-    }
+    public void WriteFrameSpanSync(ReadOnlySpan<byte> frame) => _input.Write(frame);
 
     public async ValueTask DisposeAsync()
     {
         try
         {
-            await _standardInput.FlushAsync().ConfigureAwait(false);
-            _standardInput.Close();
-
-            await _cts.CancelAsync();
+            _input.Dispose();
             await _process.WaitForExitAsync().ConfigureAwait(false);
-            await _stderrReadingTask.ConfigureAwait(false);
+            string errors = await _errors.ConfigureAwait(false);
+            if (_process.ExitCode != 0) throw new IOException($"FFmpeg exited with code {_process.ExitCode}: {errors}");
         }
-        catch (OperationCanceledException)
-        {
-            // キャンセル要求による正常終了
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "FFmpegプロセスの終了待機中に例外が発生しました。");
-        }
-        finally
-        {
-            _process.Dispose();
-            _cts.Dispose();
-        }
+        finally { _process.Dispose(); }
     }
-
-    [GeneratedRegex(@"fps=\s*([0-9.]+)", RegexOptions.Compiled)]
-    private static partial Regex FpsRegex();
 }

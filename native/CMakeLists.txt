@@ -1,0 +1,33 @@
+cmake_minimum_required(VERSION 3.24)
+project(BotamochiNvenc LANGUAGES CXX)
+include(FetchContent)
+FetchContent_Declare(nvheaders GIT_REPOSITORY https://github.com/FFmpeg/nv-codec-headers.git
+    GIT_TAG 1889e62e2d35ff7aa9baca2bceb14f053785e6f1)
+FetchContent_MakeAvailable(nvheaders)
+file(GLOB kit_compilers "C:/Program Files (x86)/Windows Kits/10/bin/*/x64/dxc.exe")
+list(SORT kit_compilers COMPARE NATURAL ORDER DESCENDING)
+find_program(DXC dxc)
+if(NOT DXC)
+    list(GET kit_compilers 0 DXC)
+endif()
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/plasma.h"
+    COMMAND "${DXC}" -T cs_6_0 -E main -O3 -Fh "${CMAKE_CURRENT_BINARY_DIR}/plasma.h" -Vn plasma plasma.hlsl
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" DEPENDS plasma.hlsl VERBATIM)
+set(pack_source "${CMAKE_CURRENT_SOURCE_DIR}/../src/Gpu/PackWave.hlsl")
+add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/PackWave.dxil"
+    COMMAND "${DXC}" -T cs_6_0 -E main -O3 -Fo "${CMAKE_CURRENT_BINARY_DIR}/PackWave.dxil" "${pack_source}"
+    DEPENDS "${pack_source}" VERBATIM)
+add_custom_target(PackWave ALL DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/PackWave.dxil")
+add_library(BotamochiNvenc SHARED encoder.cpp "${CMAKE_CURRENT_BINARY_DIR}/plasma.h")
+target_include_directories(BotamochiNvenc PRIVATE "${nvheaders_SOURCE_DIR}/include/ffnvcodec" "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_features(BotamochiNvenc PRIVATE cxx_std_17)
+target_link_libraries(BotamochiNvenc PRIVATE d3d11 d3d12 dxgi)
+set_property(TARGET BotamochiNvenc PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+set(NVENC_PGO "off" CACHE STRING "MSVC profile-guided build: off, train, or use")
+if(NVENC_PGO STREQUAL "train")
+    target_link_options(BotamochiNvenc PRIVATE /GENPROFILE "/PGD:${CMAKE_CURRENT_BINARY_DIR}/BotamochiNvenc.pgd")
+elseif(NVENC_PGO STREQUAL "use")
+    target_link_options(BotamochiNvenc PRIVATE /USEPROFILE "/PGD:${CMAKE_CURRENT_BINARY_DIR}/BotamochiNvenc.pgd")
+elseif(NOT NVENC_PGO STREQUAL "off")
+    message(FATAL_ERROR "Invalid NVENC_PGO value")
+endif()

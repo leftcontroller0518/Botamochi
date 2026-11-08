@@ -1,93 +1,100 @@
-using System.Diagnostics;
-using System.Threading.Channels;
-using Microsoft.Extensions.Logging;
 using Botamochi.Core;
 
 namespace Botamochi.Encoder;
 
-public readonly record struct VideoFramePayload(
-    NativeFrameBuffer Buffer,
-    long PtsTicks,
-    long FrameIndex
-);
-
 /// <summary>
-/// BoundedChannel によるバックプレッシャー管理とPTS/DTS同期パイプライン
+/// Single-producer/single-consumer ring with allocation-free fast paths.
 /// </summary>
-public sealed class EncoderPipeline : IAsyncDisposable
+internal sealed class EncoderPipeline : IAsyncDisposable
 {
-    private readonly Channel<VideoFramePayload> _channel;
+    private readonly NativeFrameBuffer[] _frames;
     private readonly FfmpegProcessBridge _bridge;
-    private readonly ILogger _logger;
+    private readonly AutoResetEvent _available = new(false);
+    private readonly AutoResetEvent _space = new(false);
     private readonly Task _consumerTask;
-    private readonly CancellationTokenSource _cts = new();
+    private long _read, _write;
+    private int _readSlot, _writeSlot;
+    private int _waitingConsumer, _waitingProducer;
+    private volatile bool _complete;
+    private Exception? _error;
 
-    public int QueueCount => _channel.Reader.Count;
+    public int QueueCount => (int)(Volatile.Read(ref _write) - Volatile.Read(ref _read));
 
-    public EncoderPipeline(
-        FfmpegProcessBridge bridge,
-        int boundedCapacity,
-        ILogger logger)
+    public EncoderPipeline(FfmpegProcessBridge bridge, int boundedCapacity,
+        int? numaNode = null, bool physical = false)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(boundedCapacity);
+        _frames = new NativeFrameBuffer[boundedCapacity];
         _bridge = bridge;
-        _logger = logger;
+        _consumerTask = Task.Factory.StartNew(() => Consume(numaNode, physical), CancellationToken.None,
+            TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    }
 
-        var options = new BoundedChannelOptions(boundedCapacity)
+    public void EnqueueFrame(NativeFrameBuffer buffer)
+    {
+        if (TryWrite(buffer)) return;
+        while (true)
         {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleWriter = true,
-            SingleReader = true
-        };
-
-        _channel = Channel.CreateBounded<VideoFramePayload>(options);
-        _consumerTask = Task.Run(ConsumePipelineAsync);
+            Interlocked.Exchange(ref _waitingProducer, 1);
+            if (TryWrite(buffer)) return;
+            _space.WaitOne();
+        }
     }
 
-    public async ValueTask EnqueueFrameAsync(NativeFrameBuffer buffer, long frameIndex, long ptsTicks)
+    private bool TryWrite(NativeFrameBuffer buffer)
     {
-        var payload = new VideoFramePayload(buffer, ptsTicks, frameIndex);
-        await _channel.Writer.WriteAsync(payload).ConfigureAwait(false);
+        if (_complete) throw new IOException("Encoder queue closed", _error);
+        long write = _write;
+        if (write - Volatile.Read(ref _read) == _frames.Length) return false;
+        _frames[_writeSlot] = buffer;
+        if (++_writeSlot == _frames.Length) _writeSlot = 0;
+        Volatile.Write(ref _write, write + 1);
+        if (Interlocked.Exchange(ref _waitingConsumer, 0) != 0) _available.Set();
+        return true;
     }
 
-    private async Task ConsumePipelineAsync()
+    private void Consume(int? node, bool physical)
     {
-        var reader = _channel.Reader;
-        long lastPts = 0;
-
         try
         {
-            while (await reader.WaitToReadAsync(_cts.Token).ConfigureAwait(false))
+            Botamochi.Pipeline.WorkerPlacement.Apply(0, node, physical);
+            while (true)
             {
-                while (reader.TryRead(out var frame))
+                long read = _read;
+                if (read == Volatile.Read(ref _write))
                 {
-                    // PTS/DTS 同期チェック (タイムスタンプ逆転防止)
-                    if (frame.PtsTicks < lastPts)
-                    {
-                        _logger.LogWarning("PTS Inversion detected! FrameIndex: {Index}", frame.FrameIndex);
-                    }
-                    lastPts = frame.PtsTicks;
-
-                    // FFmpeg StandardInputへの非同期書き込み
-                    byte[] frameBytes = frame.Buffer.Span.ToArray();
-                    await _bridge.WriteFrameAsync(frameBytes, _cts.Token).ConfigureAwait(false);
-
-                    // バッファを即座にネイティブプールへ返却（Zero-Allocation）
-                    frame.Buffer.Return();
+                    Interlocked.Exchange(ref _waitingConsumer, 1);
+                    if (read != Volatile.Read(ref _write)) continue;
+                    if (_complete && read == Volatile.Read(ref _write)) break;
+                    _available.WaitOne();
+                    continue;
                 }
+                NativeFrameBuffer frame = _frames[_readSlot];
+                if (++_readSlot == _frames.Length) _readSlot = 0;
+                Volatile.Write(ref _read, read + 1);
+                if (Interlocked.Exchange(ref _waitingProducer, 0) != 0) _space.Set();
+                _bridge.WriteFrameSpanSync(frame.Span);
             }
         }
-        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "エンコードパイプラインのコンシューマループでエラーが発生しました。");
+            _error = ex;
+            _complete = true;
+            if (Interlocked.Exchange(ref _waitingProducer, 0) != 0) _space.Set();
+            throw;
         }
     }
 
     public async ValueTask DisposeAsync()
     {
-        _channel.Writer.Complete();
-        await _consumerTask.ConfigureAwait(false);
-        await _bridge.DisposeAsync().ConfigureAwait(false);
-        _cts.Dispose();
+        _complete = true;
+        _available.Set();
+        try { await _consumerTask.ConfigureAwait(false); }
+        finally
+        {
+            _space.Dispose();
+            _available.Dispose();
+            await _bridge.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }
