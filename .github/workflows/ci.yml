@@ -34,7 +34,7 @@ jobs:
           dotnet-version: 10.0.x
 
       - name: Restore managed dependencies
-        run: dotnet restore src/Botamochi.csproj -r win-x64
+        run: dotnet restore src/Botamochi.csproj -r win-x64 -p:PublishAot=true
 
       - name: Build native NVENC interop and shaders
         shell: pwsh
@@ -50,7 +50,10 @@ jobs:
           dotnet publish src/Botamochi.csproj `
             -r win-x64 `
             -c Release `
-            -p:PublishProfile=NativeAot `
+            -p:PublishAot=true `
+            -p:PublishTrimmed=true `
+            -p:TrimMode=full `
+            -p:SelfContained=true `
             "-p:NvencLibrary=$nvenc" `
             "-p:WaveShader=$wave" `
             --no-restore `
@@ -59,7 +62,8 @@ jobs:
       - name: Smoke test CLI
         shell: pwsh
         run: |
-          & ./artifacts/win-x64/Botamochi.exe --help
+          $executable = Get-Item artifacts/win-x64/Botamochi.exe -ErrorAction Stop
+          & $executable.FullName --help
 
       - name: Upload Native AOT artifact
         uses: actions/upload-artifact@v7
