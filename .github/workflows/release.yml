@@ -49,7 +49,7 @@ jobs:
           dotnet-version: 10.0.x
 
       - name: Restore managed dependencies
-        run: dotnet restore src/Botamochi.csproj
+        run: dotnet restore src/Botamochi.csproj -r win-x64
 
       - name: Build native NVENC interop and shaders
         shell: pwsh
