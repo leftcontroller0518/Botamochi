@@ -76,7 +76,8 @@ jobs:
 
       - name: Smoke test CLI
         shell: pwsh
-        run: publish/win-x64/Botamochi.exe --help
+        run: |
+          & ./publish/win-x64/Botamochi.exe --help
 
       - name: Package release files
         shell: pwsh

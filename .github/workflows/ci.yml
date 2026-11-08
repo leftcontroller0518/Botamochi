@@ -58,7 +58,8 @@ jobs:
 
       - name: Smoke test CLI
         shell: pwsh
-        run: artifacts/win-x64/Botamochi.exe --help
+        run: |
+          & ./artifacts/win-x64/Botamochi.exe --help
 
       - name: Upload Native AOT artifact
         uses: actions/upload-artifact@v7
