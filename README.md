@@ -6,8 +6,6 @@ JP, [ENG](README-eng.md), [CN](README-zh.md)
 # 概要
 Botamochiは、C#用の映像レンダリング＆ハードウェアエンコード・エンジンです。
 
-Botamochiエンジンは、DirectX 12のハードウェアアクセラレーションとゼロコピー・インタープロップを極限まで駆使し、ガベージコレクション（GC）の発生を完全に排除（Zero-Allocation）したアーキテクチャを実現しています。
-
 ## 詳細技術仕様
 
 ### 1. Zero-Allocation メモリ設計 (GC非発生アーキテクチャ)
