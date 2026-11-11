@@ -1,4 +1,6 @@
 # Botamochi
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/leftcontroller0518/botamochi?utm_source=readme&utm_medium=badge)
+
 JP, [ENG](README-eng.md), [CN](README-zh.md)
 
 汎用C#映像レンダラー
